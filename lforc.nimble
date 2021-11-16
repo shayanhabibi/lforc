@@ -2,7 +2,7 @@
 
 version       = "0.1.0"
 author        = "shayanhabibi"
-description   = "BonsaiQ - tree search list queue implementation"
+description   = "LFOrc"
 license       = "MIT"
 
 
