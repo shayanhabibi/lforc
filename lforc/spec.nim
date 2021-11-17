@@ -1,17 +1,16 @@
 import wtbanland/atomics
-import lforc/thrregistry
 
 const
   maxThreads*: int = 256
   maxHps*: int = 64
 
   unmarkMask: uint = high(uint) xor uint(3)
-  orcSeq: = (1 shl 24).uint
-  bretired: (1 shl 23).uint
-  orcZero: (1 shl 22).uint
-  orcCntMask: orcSeq - 1
-  orcSeqMask: high(uint) xor orcCntMask
-  maxRetCnt:
+  orcSeq = (1 shl 24).uint
+  bretired = (1 shl 23).uint
+  orcZero = (1 shl 22).uint
+  orcCntMask = orcSeq - 1
+  orcSeqMask = high(uint) xor orcCntMask
+  maxRetCnt = 1000
 
 template oseq*(x: uint): uint = orcSeqMask and x
 template ocnt*(x: uint): uint = orcCntMask and x
@@ -26,10 +25,10 @@ type
   HpList*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
   HandOvers*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
 
-  OrcHead = object
+  OrcHead* = object
     orc: Atomic[uint]
 
-  OrcBase[T] = object
+  OrcBase*[T] = object
     orc: Atomic[uint]
     obj: T
 
@@ -49,17 +48,17 @@ type
     maxHps: Atomic[int]
     tl: array[maxThreads, TLInfo]
 
-proc initPTPOrcGc: auto =
+proc initPTPOrcGc*: auto =
   result = PTPOrcGC()
 
-template getHeader[T](objPtr: ptr T): ptr OrcHead =
+template getHeader*[T](objPtr: ptr T): ptr OrcHead =
   let backAlign = cast[uint](objPtr) - 8
   cast[ptr OrcHead](backAlign)
 
-template getOrcPtr[T](userPtr: ptr T): ptr OrcBase[T] =
+template getOrcPtr*[T](userPtr: ptr T): ptr OrcBase[T] =
   cast[ptr OrcBase[T]](getHeader userPtr)
 
-template getUserPtr[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
+template getUserPtr*[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
   let alignPtr = cast[uint](orcPtr) + 8
   result = cast[ptr T](alignPtr)
 
@@ -75,6 +74,9 @@ proc createSharedOrc*[T](tipe: typedesc[T], size: Natural): ptr T =
   let orcPtr = createShared(OrcBase[T])
   result = orcPtr.getUserPtr
   
+proc allocateSharedOrc*(size: Natural): pointer =
+  let aptr = cast[uint](allocShared(sizeof(size + 8))) + 8'u
+  result = cast[pointer](aptr)
 
 proc destroy(porc: var PTPOrcGc) =
   porc.inDestructor = true
@@ -144,13 +146,3 @@ proc getProtected[T](porc: var PTPOrcGc; tid: int; index: int; adr: ptr Atomic[T
 
 proc protectPtr(porc: var PTPOrcGc; iptr: ptr OrcHead, tid: int, idx: int) =
   porc.hp[tid][idx].store(getUnmarked(iptr), moRel)
-
-# proc initGlobalHpList*(maxThreads, maxHps: static Natural): auto =
-#   result = nucleate(GlobalHpList[maxThreads, maxHps])
-
-# proc initGlobalHandOvers*(maxThreads, maxHps: static Natural): auto =
-#   result = nucleate(GlobalHandOvers[maxThreads, maxHps])  
-
-# var globalHpList* {.global.}: GlobalHpList[maxThreads, maxHps]
-# var globalHandOvers* {.global.}: GlobalHandOvers[maxThreads, maxHps]
-# var globalPtp* {.global.}: PassThePointerOrcGc[maxThreads, maxHps]
