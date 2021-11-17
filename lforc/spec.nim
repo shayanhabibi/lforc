@@ -4,45 +4,27 @@ import lforc/thrregistry
 const
   maxThreads*: int = 256
   maxHps*: int = 64
+
   unmarkMask: uint = high(uint) xor uint(3)
+  orcSeq: = (1 shl 24).uint
+  bretired: (1 shl 23).uint
+  orcZero: (1 shl 22).uint
+  orcCntMask: orcSeq - 1
+  orcSeqMask: high(uint) xor orcCntMask
+  maxRetCnt:
 
-type
-  OrcConstants = object
-    maxThreads: int
-    maxHps: int
-    orcSeq: uint
-    bretired: uint
-    orcZero: uint
-    orcCntMask: uint
-    orcSeqMask: uint
-    maxRetCnt: int
-
-proc initOrcConstants: OrcConstants =
-  result = OrcConstants(
-    maxThreads: maxThreads,
-    maxHps: maxHps,
-    orcSeq: uint(1 shl 24),
-    bretired: uint(1 shl 23),
-    orcZero: uint(1 shl 22),
-    maxRetCnt: 1000
-  )
-  result.orcCntMask = result.orcSeq - 1
-  result.orcSeqMask = high(uint) xor result.orcCntMask
-
-const ogc* = initOrcConstants()
-
-template oseq*(x: uint): uint = ogc.orcSeqMask and x
-template ocnt*(x: uint): uint = ogc.orcCntMask and x
-template hasBitRetire*(x: uint): uint = ogc.bretired and x
+template oseq*(x: uint): uint = orcSeqMask and x
+template ocnt*(x: uint): uint = orcCntMask and x
+template hasBitRetire*(x: uint): uint = bretired and x
 template isCounterZero*(x: uint): bool =
-  let nretired = high(uint) xor ogc.bretired
-  (x and nretired and ogc.orcCntMask) == ogc.orcZero
+  let nretired = high(uint) xor bretired
+  (x and nretired and orcCntMask) == orcZero
 template getUnmarked*(x: untyped): untyped =
   cast[typeof(x)](cast[uint](x) and unmarkMask)
 
 type
-  HpList*[T] = array[ogc.maxThreads, array[ogc.maxHps, Atomic[T]]]
-  HandOvers*[T] = array[ogc.maxThreads, array[ogc.maxHps, Atomic[T]]]
+  HpList*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
+  HandOvers*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
 
   OrcHead = object
     orc: Atomic[uint]
@@ -55,7 +37,7 @@ type
   OrcPtr*[T] {.borrow.} = distinct ptr T
 
   TLInfo* = object
-    usedHaz: array[ogc.maxHps, int]
+    usedHaz: array[maxHps, int]
     retireStarted: bool
     retCnt: int
     recursiveList: seq[ptr OrcHead]
@@ -65,7 +47,7 @@ type
     hp: HpList[ptr OrcHead]
     handOvers: HandOvers[ptr OrcHead]
     maxHps: Atomic[int]
-    tl: array[ogc.maxThreads, TLInfo]
+    tl: array[maxThreads, TLInfo]
 
 proc initPTPOrcGc: auto =
   result = PTPOrcGC()
@@ -97,7 +79,7 @@ proc createSharedOrc*[T](tipe: typedesc[T], size: Natural): ptr T =
 proc destroy(porc: var PTPOrcGc) =
   porc.inDestructor = true
   var maxHps = porc.maxHps.load(moAcq)
-  for it in 0..<ogc.maxThreads:
+  for it in 0..<maxThreads:
     for ihp in 0..<maxHps:
       var obj: ptr OrcHead = porc.handOvers[it][ihp].load(moRlx)
       if not obj.isNil:
@@ -115,7 +97,7 @@ proc resetRetCnt(porc: var PTPOrcGc; tid: int) {.inline.} =
 proc getNewIdx(porc: var PTPOrcGc; tid: int, start: int = 1): int =
   var idx = start
   block loop:
-    while idx < ogc.maxHps:
+    while idx < maxHps:
       inc idx
       if not porc.tl[tid].usedHaz[idx] != 0:
         inc porc.tl[tid].usedHaz[idx]
@@ -145,8 +127,8 @@ proc clear[T](porc: var PTPOrcGc; iptr: T, idx: int, tid: int, linked: bool, reu
   elif not iptr.isNil:
     # iptr = getUnmarked(iptr) # FIXME
     var lorc: uint = iptr[].orc.load(moAcq)
-    if ocnt(lorc) == ogc.orcZero:
-      if iptr[].orc.compareExchange(lorc, lorc + ogc.bretired):
+    if ocnt(lorc) == orcZero:
+      if iptr[].orc.compareExchange(lorc, lorc + bretired):
         # retire(iptr, tid) # FIXME
         discard
 
