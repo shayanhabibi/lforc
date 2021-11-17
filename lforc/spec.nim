@@ -140,6 +140,85 @@ proc getProtected[T](porc: var PTPOrcGc; tid: int; index: int; adr: ptr Atomic[T
 proc protectPtr(porc: var PTPOrcGc; iptr: ptr OrcHead, tid: int, idx: int) =
   porc.hp[tid][idx].store(getUnmarked(iptr), moRel)
 
+proc clearBitRetired[T](porc: var PTPOrcGc; iptr: ptr OrcBase[T], tid: int): int =
+  porc.hp[tid][0].store(cast[ptr OrcHead](iptr), moRel)
+  var lorc = iptr[].orc.fetchAdd(1) # FIXME - wtf is -bretired?
+  if ocnt(lorc) == ogc.orcZero and iptr[].orc.compareExchange(lorc, lorc + ogc.bretired):
+    porc.hp[tid][0].store(cast[ptr OrcHead](0), moRlx)
+    return lorc + ogc.bretired
+  else:
+    porc.hp[tid][0].store(cast[ptr OrcHead](0), moRlx)
+    return 0
+
+proc tryHandover(porc: var PTPOrcGc; iptr: ptr OrcHead): bool =
+  block done:
+    if porc.inDestructor:
+      result = false
+      break done
+    let lmaxHps = porc.maxHps.load(moAcq)
+    for tid in 0..<ogc.maxThreads:
+      for idx in 0..<lmaxHps:
+        if iptr == porc.hp[tid][idx].load(moAcq):
+          iptr = porc.handOvers[tid][idx].exchange(iptr)
+          result = true
+          break done
+    result = false
+  
+
+proc retire[T](porc: var PTPOrcGc; iptr: ptr OrcBase[T]; tid: int) =
+  if iptr.isNil(): return
+  var rlist = porc.tl[tid].recursiveList
+  if porc.tl[tid].retireStarted:
+    rlist.add(iptr)
+    return
+  if not porc.inDestructor:
+    let lmaxHps = porc.maxHps.load(moAcq)
+    for i in 0..<lmaxHps:
+      if porc.hp[tid][i].load(moRlx) == iptr:
+        iptr = porc.handOvers[tid][i].exchange(iptr)
+        break
+  porc.tl[tid].retireStart = true
+  var i: int
+  while true:
+    while not iptr.isNil:
+      var lorc = iptr[].orc.load()
+      if not isCounterZero(lorc):
+        if (lorc = clearBitRetired(iptr, tid); lorc) == 0:
+          break
+      if tryHandover(iptr):
+        continue
+      var lorc2 = iptr[].orc.load(moAcq)
+      if lorc2 != lorc:
+        if not isCounterZero(lorc2):
+          if clearBitRetired(iptr, tid) == 0:
+            break
+          continue
+        # DELETE IPTR OBJECT TYPE CORRECTLY HERE # FIXME
+        break
+    if rlist.len() == i:
+      break
+    iptr = rlist[i]
+    inc i
+  assert i == rlist.len
+  rlist.clear()
+  porc.tl[tid].retireStarted = false
+
+proc retireOne(porc: var PTPOrcGc; tid: int) =
+  let lmaxHps = porc.maxHps.load(moAcq)
+  for idx in 0..<lmaxHps:
+    var obj = porc.handOvers[tid][idx].load(moRlx)
+    if not obj.isNil() and obj != porc.hp[tid][idx].load(moRlx):
+      obj = porc.handOvers[tid][idx].exchange(cast[ptr OrcHead](0))
+      retire(obj, tid)
+      return
+  for id in 0..<ogc.maxThreads:
+    if id == tid: continue
+    for idx in 0..<lmaxHps:
+      var obj = porc.handovers[id][idx].load(moAcq)
+      if not obj.isNil() and obj != porc.hp[id][idx].load(moAcq):
+        obj = porc.handOvers[id][idx].exchange(cast[ptr OrcHead](0), moRlx)
+        retire(obj, tid)
+        return
 # proc initGlobalHpList*(maxThreads, maxHps: static Natural): auto =
 #   result = nucleate(GlobalHpList[maxThreads, maxHps])
 
