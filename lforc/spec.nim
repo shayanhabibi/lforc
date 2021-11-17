@@ -1,4 +1,5 @@
 import wtbanland/atomics
+import lforc/thrregistry
 
 const
   maxThreads*: int = 256
@@ -66,10 +67,32 @@ type
     maxHps: Atomic[int]
     tl: array[ogc.maxThreads, TLInfo]
 
-var tid {.threadvar.}: int
-
 proc initPTPOrcGc: auto =
   result = PTPOrcGC()
+
+template getHeader[T](objPtr: ptr T): ptr OrcHead =
+  let backAlign = cast[uint](objPtr) - 8
+  cast[ptr OrcHead](backAlign)
+
+template getOrcPtr[T](userPtr: ptr T): ptr OrcBase[T] =
+  cast[ptr OrcBase[T]](getHeader userPtr)
+
+template getUserPtr[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
+  let alignPtr = cast[uint](orcPtr) + 8
+  result = cast[ptr T](alignPtr)
+
+converter toOPtr[T](orcBasePtr: ptr OrcBase[T]): ptr OrcHead = cast[ptr OrcHead](orcBasePtr)
+converter toOBasePtr[T](orcPtr: ptr OrcBase): ptr OrcBase[T] = cast[ptr OrcBase[T]](orcPtr)
+# converter toUserPtr[T](orcBasePtr: ptr OrcBase[T]): ptr T = orcBasePtr.getUserPtr()
+
+proc createSharedOrc*[T](tipe: typedesc[T], size: Natural): ptr T =
+  ## Principal: Allocate shared block with 8 byte header for metadata
+  # Issue with this is that sizeof will not correctly indicate the size of the object
+  # this also plays issues if the object the person has created is supposed to be
+  # cache lined since they will be unaware that the object is not ipsilateral
+  let orcPtr = createShared(OrcBase[T])
+  result = orcPtr.getUserPtr
+  
 
 proc destroy(porc: var PTPOrcGc) =
   porc.inDestructor = true
