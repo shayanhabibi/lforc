@@ -1,4 +1,4 @@
-import lforc/thrregistry
+import lforc/threadreg
 import lforc/spec
 import lforc/ptp
 import wtbanland/atomics
@@ -18,6 +18,14 @@ type
     handOvers: HandOvers[ptr OrcHead]
     maxHps: Atomic[int]
     tl: array[maxThreads, TLInfo]
+  OrcPtr*[T] = object
+    pntr*: T
+    tid*:  int16
+    idx*: int8
+    lnk*: bool
+
+  OrcUnsafePtr*[T] = object
+    pntr*: T
 
 var gorc* {.global.}: PTPOrcGc
 
@@ -56,14 +64,14 @@ proc tearDownOrcGc =
 
 # In terms of optimisation, objects will contain the thread ids themselves
 # and may use that instead of fetching the value. Benchmark?
-proc addRetCnt(tid: int = tid): int {.inline.} =
+proc addRetCnt(tid: int): int {.inline.} =
   inc gorc.tl[tid].retCnt
   gorc.tl[tid].retCnt
 
-proc resetRetCnt(tid: int = tid) {.inline.} =
+proc resetRetCnt(tid: int) {.inline.} =
   gorc.tl[tid].retCnt = 0
 
-proc getNewIdx(start: int = 1; tid: int = tid): int =
+proc getNewIdx(tid: int; start: int = 1): int =
   var idx = start
   block loop:
     while idx < maxHps:
@@ -77,11 +85,11 @@ proc getNewIdx(start: int = 1; tid: int = tid): int =
         break loop
     raise newException(ValueError, "ERROR: maxHps is not enough for all the hazard pointers in the algorithm")
 
-proc usingIdx(idx: int, tid: int = tid) =
+proc usingIdx(tid: int; idx: int) =
   if not idx == 0:
     inc gorc.tl[tid].usedHaz[idx]
 
-proc cleanIdx(idx: int; tid: int = tid): int =
+proc cleanIdx(tid: int; idx: int): int =
   if idx == 0:
     -1
   else:
@@ -89,7 +97,7 @@ proc cleanIdx(idx: int; tid: int = tid): int =
     gorc.tl[tid].usedHaz[idx]
 
 proc clear[T](iptr: T, idx: int, tid: int, linked: bool, reuse: bool) =
-  if not reuse and cleanIdx(idx, tid) != 0:
+  if not reuse and cleanIdx(tid=tid, idx=idx) != 0:
     discard
   elif linked:
     discard
@@ -101,22 +109,44 @@ proc clear[T](iptr: T, idx: int, tid: int, linked: bool, reuse: bool) =
         # retire(iptr, tid) # FIXME
         discard
 
-proc getUsedHaz(idx: int; tid: int = tid): int {.inline.} =
+proc getUsedHaz(tid: int; idx: int): int {.inline.} =
   gorc.tl[tid].usedHaz[idx]
 
-proc getProtected[T](index: int; adr: ptr Atomic[T]; tid: int = tid): T =
+proc getProtected[T](tid: int; index: int; adr: ptr Atomic[T]): T =
   var pub, iptr: T = nil
   while (pub = adr[].load(moRlx); pub) != iptr:
     discard
     # porc.hp[tid][index].store(getUnmarked(pub)) # FIXME
   result = pub
 
-proc protectPtr(iptr: ptr OrcHead, idx: int; tid: int = tid) =
+proc protectPtr(iptr: ptr OrcHead; tid: int; idx: int) =
   gorc.hp[tid][idx].store(getUnmarked(iptr), moRel)
 
 proc initOrcPtr[T](pntr: T, tid: int16, idx: int8, linked: bool): OrcPtr[T] =
   OrcPtr[T](pntr, tid, idx, linked)
 
 proc initOrcPtr(porc: var PTPOrcGc): OrcPtr[pointer] =
-  result = OrcPtr[pointer](tid: cast[int16](tid))
+  result = OrcPtr[pointer](tid: cast[int16](getTid))
   result.idx = cast[int8](getNewIdx result.tid)
+
+proc `==`[T](x, y: OrcPtr[T] | OrcUnsafePtr[T]): bool =
+  x.pntr == y.pntr
+proc `==`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool =
+  x.pntr == y
+proc `!=`[T](x, y: OrcPtr[T] | OrcUnsafePtr[T]): bool =
+  x.pntr != y.pntr
+proc `!=`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool =
+  x.pntr != y
+proc `[]`[T](x: OrcUnsafePtr[T] | OrcPtr[T]): T =
+  x.pntr
+
+proc `=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
+  x.tid = y.tid
+  x.idx = y.idx
+  x.pntr = y.pntr
+  x.lnk = y.lnk
+  if x.idx == 0:
+    x.idx = getNewIdx(tid = x.tid)
+    protectPtr(x.pntr, x.tid.int, x.idx.int)
+  else:
+    usingIdx(x.idx, x.tid)

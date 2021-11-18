@@ -35,14 +35,14 @@ proc getOrcThreadId(): int =
 
 var tidValue {.threadvar.}: int
 
-template tid*: int =
+template getTid*: int =
   if unlikely(tidValue == 0):
     tidValue = getOrcThreadId() + 1
   tidValue - 1
 
 proc releaseThreadId*() =
-  var arrayIdx = tid div 64
-  var idx = tid mod 64
+  var arrayIdx = getTid div 64
+  var idx = getTid mod 64
   var bitLine: uint = threadRegistry[arrayIdx].load(moRel)
   if unlikely((bitLine and (1'u shl idx.uint)) != 0'u):
     raise newException(ValueError, "Wtf happened; how is this even possible lol")
@@ -56,4 +56,4 @@ proc initThreadRegistry* =
   var highnum = high(uint)
   for r in thrReg():
     r.unsafeaddr[].store(highnum)
-  assert tid() == 0,  "Thread Registry has already been initiatialised"
+  assert getTid() == 0,  "Thread Registry has already been initiatialised"

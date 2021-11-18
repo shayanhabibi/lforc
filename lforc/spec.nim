@@ -33,12 +33,6 @@ type
     obj*: T
 
   OrcAtomic*[T] {.borrow.} = distinct Atomic[T]
-  OrcPtr*[T] = object
-    pntr*: T
-    tid*:  int16
-    idx*: int8
-    lnk*: bool
-
 
 template getHeader*[T](objPtr: ptr T): ptr OrcHead =
   let backAlign = cast[uint](objPtr) - 8
