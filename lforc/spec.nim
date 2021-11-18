@@ -5,12 +5,12 @@ const
   maxHps*: int = 64
 
   unmarkMask: uint = high(uint) xor uint(3)
-  orcSeq = (1 shl 24).uint
-  bretired = (1 shl 23).uint
-  orcZero = (1 shl 22).uint
-  orcCntMask = orcSeq - 1
-  orcSeqMask = high(uint) xor orcCntMask
-  maxRetCnt = 1000
+  orcSeq* = (1 shl 24).uint
+  bretired* = (1 shl 23).uint
+  orcZero* = (1 shl 22).uint
+  orcCntMask* = orcSeq - 1
+  orcSeqMask* = high(uint) xor orcCntMask
+  maxRetCnt* = 1000
 
 template oseq*(x: uint): uint = orcSeqMask and x
 template ocnt*(x: uint): uint = orcCntMask and x
@@ -26,30 +26,19 @@ type
   HandOvers*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
 
   OrcHead* = object
-    orc: Atomic[uint]
+    orc*: Atomic[uint]
 
   OrcBase*[T] = object
-    orc: Atomic[uint]
-    obj: T
+    orc*: Atomic[uint]
+    obj*: T
 
   OrcAtomic*[T] {.borrow.} = distinct Atomic[T]
-  OrcPtr*[T] {.borrow.} = distinct ptr T
+  OrcPtr*[T] = object
+    pntr*: T
+    tid*:  int16
+    idx*: int8
+    lnk*: bool
 
-  TLInfo* = object
-    usedHaz: array[maxHps, int]
-    retireStarted: bool
-    retCnt: int
-    recursiveList: seq[ptr OrcHead]
-
-  PTPOrcGc = object
-    inDestructor: bool
-    hp: HpList[ptr OrcHead]
-    handOvers: HandOvers[ptr OrcHead]
-    maxHps: Atomic[int]
-    tl: array[maxThreads, TLInfo]
-
-proc initPTPOrcGc*: auto =
-  result = PTPOrcGC()
 
 template getHeader*[T](objPtr: ptr T): ptr OrcHead =
   let backAlign = cast[uint](objPtr) - 8
@@ -65,84 +54,3 @@ template getUserPtr*[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
 converter toOPtr[T](orcBasePtr: ptr OrcBase[T]): ptr OrcHead = cast[ptr OrcHead](orcBasePtr)
 converter toOBasePtr[T](orcPtr: ptr OrcBase): ptr OrcBase[T] = cast[ptr OrcBase[T]](orcPtr)
 # converter toUserPtr[T](orcBasePtr: ptr OrcBase[T]): ptr T = orcBasePtr.getUserPtr()
-
-proc createSharedOrc*[T](tipe: typedesc[T], size: Natural): ptr T =
-  ## Principal: Allocate shared block with 8 byte header for metadata
-  # Issue with this is that sizeof will not correctly indicate the size of the object
-  # this also plays issues if the object the person has created is supposed to be
-  # cache lined since they will be unaware that the object is not ipsilateral
-  let orcPtr = createShared(OrcBase[T])
-  result = orcPtr.getUserPtr
-  
-proc allocateSharedOrc*(size: Natural): pointer =
-  let aptr = cast[uint](allocShared(sizeof(size + 8))) + 8'u
-  result = cast[pointer](aptr)
-
-proc destroy(porc: var PTPOrcGc) =
-  porc.inDestructor = true
-  var maxHps = porc.maxHps.load(moAcq)
-  for it in 0..<maxThreads:
-    for ihp in 0..<maxHps:
-      var obj: ptr OrcHead = porc.handOvers[it][ihp].load(moRlx)
-      if not obj.isNil:
-        var lorc: uint = obj[].orc.load(moRlx)
-        porc.handOvers[it][ihp].store(nil, moRlx)
-        # retire(obj, tid) # FIXME
-
-proc addRetCnt(porc: var PTPOrcGc; tid: int): int {.inline.} =
-  inc porc.tl[tid].retCnt
-  porc.tl[tid].retCnt
-
-proc resetRetCnt(porc: var PTPOrcGc; tid: int) {.inline.} =
-  porc.tl[tid].retCnt = 0
-
-proc getNewIdx(porc: var PTPOrcGc; tid: int, start: int = 1): int =
-  var idx = start
-  block loop:
-    while idx < maxHps:
-      inc idx
-      if not porc.tl[tid].usedHaz[idx] != 0:
-        inc porc.tl[tid].usedHaz[idx]
-        var curMax = porc.maxHps.load(moRlx)
-        while curMax <= idx:
-          discard porc.maxHps.compareExchange(curMax, idx + 1)
-        result = idx
-        break loop
-    raise newException(ValueError, "ERROR: maxHps is not enough for all the hazard pointers in the algorithm")
-
-proc usingIdx(porc: var PTPOrcGc; tid: int, idx: int) =
-  if not idx == 0:
-    inc porc.tl[tid].usedHaz[idx]
-
-proc cleanIdx(porc: var PTPOrcGc; tid: int; idx: int): int =
-  if idx == 0:
-    -1
-  else:
-    dec porc.tl[tid].usedHaz[idx]
-    porc.tl[tid].usedHaz[idx]
-
-proc clear[T](porc: var PTPOrcGc; iptr: T, idx: int, tid: int, linked: bool, reuse: bool) =
-  if not reuse and cleanIdx(tid, idx) != 0:
-    discard
-  elif linked:
-    discard
-  elif not iptr.isNil:
-    # iptr = getUnmarked(iptr) # FIXME
-    var lorc: uint = iptr[].orc.load(moAcq)
-    if ocnt(lorc) == orcZero:
-      if iptr[].orc.compareExchange(lorc, lorc + bretired):
-        # retire(iptr, tid) # FIXME
-        discard
-
-proc getUsedHaz(porc: var PTPOrcGc; tid: int; idx: int): int {.inline.} =
-  porc.tl[tid].usedHaz[idx]
-
-proc getProtected[T](porc: var PTPOrcGc; tid: int; index: int; adr: ptr Atomic[T]): T =
-  var pub, iptr: T = nil
-  while (pub = adr[].load(moRlx); pub) != iptr:
-    discard
-    # porc.hp[tid][index].store(getUnmarked(pub)) # FIXME
-  result = pub
-
-proc protectPtr(porc: var PTPOrcGc; iptr: ptr OrcHead, tid: int, idx: int) =
-  porc.hp[tid][idx].store(getUnmarked(iptr), moRel)
