@@ -27,6 +27,8 @@ type
   OrcUnsafePtr*[T] = object
     pntr*: T
 
+  OrcAtomic*[T] {.borrow.} = distinct Atomic[T]
+
 var gorc* {.global.}: PTPOrcGc
 
 proc initPTPOrcGc =
@@ -85,7 +87,7 @@ proc getNewIdx(tid: int; start: int = 1): int =
         break loop
     raise newException(ValueError, "ERROR: maxHps is not enough for all the hazard pointers in the algorithm")
 
-proc usingIdx(tid: int; idx: int) =
+proc usingIdx(idx: int; tid: int) =
   if not idx == 0:
     inc gorc.tl[tid].usedHaz[idx]
 
@@ -109,7 +111,7 @@ proc clear[T](iptr: T, idx: int, tid: int, linked: bool, reuse: bool) =
         # retire(iptr, tid) # FIXME
         discard
 
-proc getUsedHaz(tid: int; idx: int): int {.inline.} =
+proc getUsedHaz(idx: int; tid: int): int {.inline.} =
   gorc.tl[tid].usedHaz[idx]
 
 proc getProtected[T](tid: int; index: int; adr: ptr Atomic[T]): T =
@@ -140,13 +142,143 @@ proc `!=`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool =
 proc `[]`[T](x: OrcUnsafePtr[T] | OrcPtr[T]): T =
   x.pntr
 
-proc `=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
-  x.tid = y.tid
-  x.idx = y.idx
-  x.pntr = y.pntr
-  x.lnk = y.lnk
-  if x.idx == 0:
-    x.idx = getNewIdx(tid = x.tid)
-    protectPtr(x.pntr, x.tid.int, x.idx.int)
+proc copy[T](x: OrcPtr[T]): var OrcPtr[T] =
+  result.tid = x.tid
+  result.idx = x.idx
+  result.pntr = x.pntr
+  result.lnk = x.lnk
+  if result.idx == 0:
+    result.idx = getNewIdx(tid = result.tid)
+    protectPtr(result.pntr, result.tid.int, result.idx.int)
   else:
     usingIdx(x.idx, x.tid)
+
+proc copyMove[T](x: OrcPtr[T]): var OrcPtr[T] =
+  result.tid = x.tid
+  result.idx = x.idx
+  result.pntr = x.pntr
+  result.lnk = x.lnk
+  if result.idx == 0:
+    result.idx = getNewIdx(tid = result.tid)
+    protectPtr(result.pntr, result.tid.int, result.idx.int)
+  else:
+    x.idx = 0
+
+proc copy[T](x: OrcUnsafePtr[T]): var OrcPtr[T] =
+  result.tid = getTid()
+  result.idx = getNewIdx(result.tid)
+  result.pntr = x.pntr
+  result.lnk = true
+  protectPtr(result.pntr, result.tid, result.idx)
+
+proc `=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
+  var reuseIdx: bool =
+    y.idx < x.idx and
+    getUsedHaz(x.idx, x.tid) == 1
+  clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  if y.idx < x.idx:
+    if not reuseIdx:
+      x.idx = getNewIdx(x.tid, y.idx + 1)
+    protectPtr(y.pntr, x.tid, x.idx)
+  else:
+    usingIdx(y.idx, x.tid)
+    x.idx = y.idx
+  x.pntr = y.pntr
+  x.lnk = y.lnk
+
+proc `move=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
+  ## Not sure what to do about this :/
+  var reuseIdx: bool =
+    y.idx < x.idx and
+    getUsedHaz(x.idx, x.tid) == 1
+  clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  if y.idx < x.idx:
+    if not reuseIdx:
+      x.idx = getNewIdx(x.tid, y.idx + 1)
+    protectPtr(y.pntr, x.tid, x.idx)
+  else:
+    x.idx = y.idx
+    y.idx = 0
+  x.pntr = y.pntr
+  x.lnk = y.lnk
+
+proc `move=`[T](x: var OrcPtr[T], y: OrcUnsafePtr[T]) =
+  var reuseIdx: bool = getUsedHaz(x.idx, x.tid) == 1
+  clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  if not reuseIdx:
+    x.idx = getNewIdx(x.tid)
+  protectPtr(y.pntr, x.tid, x.idx)
+  x.pntr = y.pntr
+  x.lnk = true
+
+proc incrementOrc(pntr: ptr OrcHead) =
+  block:
+    if pntr.isNil:
+      break
+    var lorc: uint = pntr[].orc.fetchAdd(1) + 1
+    if ocnt(lorc) != orcZero:
+      break
+    if pntr[].orc.compareExchange(lorc, lorc + bretired):
+      ## retire(pntr) # FIXME IMPL
+      break
+
+proc decrementOrc(pntr: ptr OrcHead) =
+  block:
+    if pntr.isNil:
+      break
+    let tid = getTid()
+    protectPtr(pntr, tid, 0)
+    var lorc: uint = pntr[].orc.fetchAdd(orcSeq-1) + orcSeq - 1
+    if addRetCnt(tid) == maxRetCnt:
+      # retireOne(tid) # FIXME IMPL
+      resetRetCnt(tid)
+    if ocnt(lorc) != orcZero:
+      break
+    if pntr[].orc.compareExchange(lorc, lorc + bretired):
+      # retire(pntr, tid) # FIXME IMPL
+      break
+
+proc initOrcAtomic[T](val: T): OrcAtomic[T] =
+  incrementOrc(val)
+  result.store(val, moRlx)
+
+proc `=destroy`[T](x: var OrcAtomic[T]) =
+  block:
+    var pntr = x.load(moRlx)
+    if pntr.isNil:
+      break
+    decrementOrc(pntr)
+
+proc `[]`[T](x: var OrcAtomic[T]): var T =
+  x.load()
+
+proc `[]=`[T](x: var OrcAtomic[T], y: T) =
+  x.store(y)
+
+proc `=`[T](x: var OrcAtomic[T]; y: OrcAtomic[T]) =
+  x.store(y.load())
+
+proc retire(pntr: var ptr OrcHead, tid: int = getTid()) =
+  block retire:
+    if pntr.isNil:
+      break retire
+    var rlist = gorc.tl[tid].recursiveList
+    if gorc.tl[tid].retireStarted:
+      rlist.add(pntr)
+      break retire
+    if not gorc.inDestructor:
+      let lmaxHps = gorc.maxHps.load(moAcq)
+      for i in 0..<lmaxHps:
+        if gorc.hp[tid][i].load(moRlx) == pntr:
+          pntr = gorc.handOvers[tid][i].exchange(pntr)
+          break
+    var i: int
+    gorc.tl[tid].retireStarted = true
+    while true:
+      while not pntr.isNil:
+        var lorc = pntr.orc.load()
+        if not isCounterZero(lorc):
+          if (lorc = clearBitRetired(pntr, tid); lorc) == 0:
+            break
+        if tryHandover(pntr):
+          continue
