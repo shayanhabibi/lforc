@@ -24,25 +24,27 @@ type
   PTPOrcGc = object
     # The global lforc object
     inDestructor: bool # Whether a lforc thread is in a destructor sequence
-    hp: HpList[ptr OrcHead] # matrix of thread hazard pointers
-    handOvers: HandOvers[ptr OrcHead] # matrix of thread hand over pointers
+    hp: HpList # matrix of thread hazard pointers
+    handOvers: HandOvers # matrix of thread hand over pointers
     maxHps: Atomic[int] # Max hazard pointers in matrices
     tl: array[maxThreads, TLInfo] # matrix of thread local information objects
   OrcPtr*[T] = object
     # Orc pointer ~ serves like a sharedptr in that it contains the pointer
     # to the object and the meta deta following it
-    pntr*: T # 
+    pntr*: ptr OrcBase[T]
     tid*:  int16
     idx*: int8
     lnk*: bool
 
-  OrcUnsafePtr*[T] = object
+  OrcUnsafePtr* = object
     # Internal Orc Pointer generated initially from loads
-    pntr*: T
+    pntr*: ptr OrcHead
 
-  OrcAtomic*[T] {.borrow.} = distinct Atomic[T]
+  OrcAtomic*[T: ptr OrcHead] {.borrow.} = distinct Atomic[T]
   # Replaces std Atomic[T] to be used with orc objects as it will decrement/increment
   # the objects as necessary
+
+converter toI8(x: int): int8 = cast[int8](x)
 
 # Begin  | Forward decls
 # =====================================================
@@ -59,16 +61,16 @@ proc resetRetCnt(tid: int) {.inline.}
 # =====================================================
 # End    | Forward decls
 
-proc destroy(porc: var PTPOrcGc) =
+proc `=destroy`(x: var PTPOrcGc) =
   ## Cleans up and destroys the lforc object passed
-  porc.inDestructor = true
-  var maxHps = porc.maxHps.load(moAcq)
+  x.inDestructor = true
+  var maxHps = x.maxHps.load(moAcq)
   for it in 0..<maxThreads:
     for ihp in 0..<maxHps:
-      var obj: ptr OrcHead = porc.handOvers[it][ihp].load(moRlx)
+      var obj: ptr OrcHead = x.handOvers[it][ihp].load(moRlx)
       if not unlikely obj.isNil:
         var lorc: uint = obj[].orc.load(moRlx)
-        porc.handOvers[it][ihp].store(nil, moRlx)
+        x.handOvers[it][ihp].store(nil, moRlx)
         retire(obj, getTid)
 
 # Global symbol for the lforc object
@@ -83,7 +85,7 @@ proc initPTPOrcGc =
 
 
 proc tearDownOrcGc =
-  destroy(gorc)
+  `=destroy`(gorc)
 
 
 # In terms of optimisation, objects will contain the thread ids themselves
@@ -104,33 +106,17 @@ proc getNewIdx(tid: int; start: int = 1): int =
     raise newException(ValueError, "ERROR: maxHps is not enough for all the hazard pointers in the algorithm")
 
 proc usingIdx(idx: int; tid: int = getTid) {.inline.} =
-  # NOTE would this be optimised as a template?
   if not idx == 0:
     inc gorc.tl[tid].usedHaz[idx]
 
 proc cleanIdx(tid: int; idx: int): int {.inline.} =
-  # NOTE would this be optimised as a template?
   if idx == 0:
     result = -1
   else:
     dec gorc.tl[tid].usedHaz[idx]
     result = gorc.tl[tid].usedHaz[idx]
 
-# NOTE - access to orc field on pntr makes it likely that this is a ptr to orcbase
-# or orchead; therefore might as well just directly point to orchead?
-# proc clear[T](pntr: T, idx: int, tid: int, linked: bool, reuse: bool) {.inline.} =
-#   if not reuse and cleanIdx(tid=tid, idx=idx) != 0:
-#     discard
-#   elif linked:
-#     discard
-#   elif not pntr.isNil:
-#     pntr = getUnmarked(pntr) # LINK
-#     var lorc: uint = pntr[].orc.load(moAcq)
-#     if ocnt(lorc) == orcZero:
-#       if pntr[].orc.compareExchange(lorc, lorc + bretired):
-#         retire(pntr, tid)
-#         discard
-proc clear(pntr: var ptr OrcHead, idx: int, tid: int, linked: bool, reuse: bool) {.inline.} =
+proc clear(pntr: sink ptr OrcHead, idx: int, tid: int, linked: bool, reuse: bool) {.inline.} =
   if not reuse and cleanIdx(tid = tid, idx = idx) != 0:
     discard
   elif linked:
@@ -138,18 +124,16 @@ proc clear(pntr: var ptr OrcHead, idx: int, tid: int, linked: bool, reuse: bool)
   elif not pntr.isNil:
     pntr = getUnmarked(pntr) # LINK
     var lorc: uint = pntr.orc.load(moAcq)
+    echo "this"
     if ocnt(lorc) == orcZero:
       if pntr.orc.compareExchange(lorc, lorc + bretired):
         retire(pntr, tid)
 
-proc clear[T](pntr: var ptr OrcBase[T], idx: int, tid: int, linked: bool, reuse: bool) {.inline.} =
-  pntr.toOHeadPtr.clear(idx, tid, linked, reuse)
-
 proc getUsedHaz(idx: int; tid: int = getTid): int {.inline.} =
   result = gorc.tl[tid].usedHaz[idx]
 
-proc getProtected[T](index: int; adr: ptr Atomic[T]; tid: int = getTid): T {.inline.} =
-  var pub, pntr: T = nil
+proc getProtected(index: int; adr: ptr Atomic[ptr OrcHead]; tid: int = getTid): ptr OrcHead {.inline.} =
+  var pub, pntr: ptr OrcHead = nil
   while (pub = adr[].load(moRlx); pub) != pntr:
     gorc.hp[tid][index].store(getUnmarked(pub)) # LINK
     pntr = pub
@@ -158,39 +142,33 @@ proc getProtected[T](index: int; adr: ptr Atomic[T]; tid: int = getTid): T {.inl
 proc protectPtr(pntr: ptr OrcHead; tid: int; idx: int) {.inline.} =
   gorc.hp[tid][idx].store(getUnmarked(pntr), moRel)
 
-proc protectPtr[T](pntr: ptr OrcBase[T]; tid: int; idx: int) {.inline.} =
-  pntr.toOHeadPtr.protectPtr(tid, idx)
-
 # proc initOrcPtr(pntr: ptr OrcHead, tid: int16, idx: int8, linked: bool): OrcPtr[ptr OrcHead] =
   # OrcPtr[ptr OrcHead](pntr, tid, idx, linked)
 # proc initOrcPtr[T](pntr: ptr OrcBase[T], tid: int16, idx: int8, linked: bool): OrcPtr[ptr OrcBase[T]] =
   # OrcPtr[ptr OrcBase[T]](pntr, tid, idx, linked)
 
-proc initOrcPtr(): OrcPtr[ptr OrcHead] =
-  result = OrcPtr[ptr OrcHead](tid: cast[int16](getTid))
+proc initOrcPtr(): OrcPtr[void] =
+  result = OrcPtr[void](tid: cast[int16](getTid))
   result.idx = cast[int8](getNewIdx result.tid)
 
-proc initOrcPtr[T](pntr: ptr OrcBase[T]): OrcPtr[ptr OrcBase[T]] =
-  result = OrcPtr[ptr OrcBase[T]](tid: cast[int16](getTid))
+proc initOrcPtr[T](pntr: ptr OrcBase[T]): OrcPtr[T] =
+  result = OrcPtr[T](tid: cast[int16](getTid))
   result.idx = cast[int8](getNewIdx result.tid)
+  result.pntr = pntr
 
-proc destroy[T](x: var OrcPtr[T]) =
-  clear(x.pntr, x.idx, x.tid, x.lnk, false)
-proc destroy(x: var OrcPtr[ptr OrcHead]) =
-  clear(x.pntr, x.idx, x.tid, x.lnk, false)
-proc destroy[T](x: var OrcPtr[ptr OrcBase[T]]) =
+proc `=destroy`[T](x: var OrcPtr[T]) =
   clear(x.pntr, x.idx, x.tid, x.lnk, false)
 
-proc `==`[T](x, y: OrcPtr[T] | OrcUnsafePtr[T]): bool {.inline.} =
+proc `==`[T](x, y: OrcPtr[T] | OrcUnsafePtr): bool {.inline.} =
   x.pntr == y.pntr
-proc `==`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool {.inline.} =
+proc `==`[T](x: OrcUnsafePtr | OrcPtr[T], y: T): bool {.inline.} =
   x.pntr == y
-proc `!=`[T](x, y: OrcPtr[T] | OrcUnsafePtr[T]): bool {.inline.} =
+proc `!=`[T](x, y: OrcPtr[T] | OrcUnsafePtr): bool {.inline.} =
   x.pntr != y.pntr
-proc `!=`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool {.inline.} =
+proc `!=`[T](x: OrcUnsafePtr | OrcPtr[T], y: T): bool {.inline.} =
   x.pntr != y
-proc `[]`[T](x: OrcUnsafePtr[T] | OrcPtr[T]): T {.inline.} =
-  x.pntr
+proc `[]`[T](x: OrcUnsafePtr | OrcPtr[T]): var T {.inline.} =
+  x.pntr[].obj
 
 proc copy[T](x: OrcPtr[T]): var OrcPtr[T] {.inline.} =
   result.tid = x.tid
@@ -202,22 +180,36 @@ proc copy[T](x: OrcPtr[T]): var OrcPtr[T] {.inline.} =
     protectPtr(result.pntr, result.tid.int, result.idx.int)
   else:
     usingIdx(x.idx, x.tid)
-proc copy[T](x: OrcPtr[ptr OrcBase[T]]): var OrcPtr[ptr OrcBase[T]] {.inline.} =
-  result = copy(x)
 
-proc copy(x: OrcPtr[ptr OrcHead]): var OrcPtr[ptr OrcHead] {.inline.} =
-  result = copy(x)
+# proc `=copy`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
+#   if x == y: return
+#   `=destroy`(x)
+#   wasMoved x
+#   x.tid = y.tid
+#   x.idx = y.idx
+#   x.pntr = y.pntr
+#   x.lnk = y.lnk
+#   if x.idx == 0:
+#     x.idx = getNewIdx(tid = x.tid.int)
+#     protectPtr(x.pntr, x.tid.int, x.idx.int)
+#   else:
+#     usingIdx(y.idx, y.tid)
+# proc copy[T](x: OrcPtr[ptr OrcBase[T]]): var OrcPtr[ptr OrcBase[T]] {.inline.} =
+#   result = copy(x)
 
-proc copyMove[T](x: OrcPtr[T]): var OrcPtr[T] =
-  result.tid = x.tid
-  result.idx = x.idx
-  result.pntr = x.pntr
-  result.lnk = x.lnk
-  if result.idx == 0:
-    result.idx = getNewIdx(tid = result.tid)
-    protectPtr(result.pntr, result.tid.int, result.idx.int)
-  else:
-    x.idx = 0
+# proc copy(x: OrcPtr[ptr OrcHead]): var OrcPtr[ptr OrcHead] {.inline.} =
+#   result = copy(x)
+
+# proc copyMove[T](x: OrcPtr[T]): var OrcPtr[T] =
+#   result.tid = x.tid
+#   result.idx = x.idx
+#   result.pntr = x.pntr
+#   result.lnk = x.lnk
+#   if result.idx == 0:
+#     result.idx = getNewIdx(tid = result.tid)
+#     protectPtr(result.pntr, result.tid.int, result.idx.int)
+#   else:
+#     x.idx = 0
   # NOTE does this mean I should call a moved on the original?
   # move x
   #[
@@ -238,7 +230,7 @@ proc copyMove[T](x: OrcPtr[T]): var OrcPtr[T] =
     }
   ]#
 
-proc copy[T](x: OrcUnsafePtr[T]): var OrcPtr[T] =
+proc copy[T](x: OrcUnsafePtr): var OrcPtr[T] =
   result.tid = getTid()
   result.idx = getNewIdx(result.tid)
   result.pntr = x.pntr
@@ -250,6 +242,7 @@ proc `=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
     y.idx < x.idx and
     getUsedHaz(x.idx, x.tid) == 1
   clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  wasMoved x
   if y.idx < x.idx:
     if not reuseIdx:
       x.idx = getNewIdx(x.tid, y.idx + 1)
@@ -260,67 +253,32 @@ proc `=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
   x.pntr = y.pntr
   x.lnk = y.lnk
 
-proc `move=`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
+proc `=sink`[T](x: var OrcPtr[T], y: OrcPtr[T]) =
   var reuseIdx: bool =
     y.idx < x.idx and
     getUsedHaz(x.idx, x.tid) == 1
   clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  wasMoved x
   if y.idx < x.idx:
     if not reuseIdx:
       x.idx = getNewIdx(x.tid, y.idx + 1)
     protectPtr(y.pntr, x.tid, x.idx)
   else:
     x.idx = y.idx
-    y.idx = 0
+    y.unsafeAddr.idx = 0
   x.pntr = y.pntr
   x.lnk = y.lnk
-  # NOTE if this is a move operation, do I perform a move on other? or do i sink y?
-  # move y
-#[
-    // Move assignment operator (orc-to-orc)
-    inline orc_ptr& operator=(orc_ptr&& other) {
-        PassThePointerOrcGC* ptp = &g_ptp;
-        bool reuseIdx = ((other.idx < idx) && (ptp->getUsedHaz(idx, tid) == 1));
-        ptp->clear(ptr, idx, tid, lnk, reuseIdx);
-        if (other.idx < idx) {
-            if (!reuseIdx) idx = ptp->getNewIdx(tid, other.idx+1);
-            ptp->protect_ptr(other.ptr, tid, idx);
-        } else {
-            // Steal the other's reference
-            idx = other.idx;
-            other.idx = 0;
-        }
-        ptr = other.ptr;
-        lnk = other.lnk;
-        return *this;
-    }
 
-]#
 
-proc `move=`[T](x: var OrcPtr[T], y: OrcUnsafePtr[T]) =
+proc `move=`[T](x: var OrcPtr[T], y: sink OrcUnsafePtr) =
   var reuseIdx: bool = getUsedHaz(x.idx, x.tid) == 1
   clear(x.pntr, x.idx, x.tid, x.lnk, reuseIdx)
+  wasMoved x
   if not reuseIdx:
     x.idx = getNewIdx(x.tid)
   protectPtr(y.pntr, x.tid, x.idx)
   x.pntr = y.pntr
-  x.lnk = true
-  # NOTE like before, how is a move assignment in cpp implemented?
-  #[
-    // Move assignment (internal-to-orc)
-    //other comes always from a load and other.idx is 0
-    inline orc_ptr& operator=(orc_unsafe_internal_ptr<T>&& other) {
-        // This may be called once or twice. If called twice, 'other' is the just-moved-from orc_ptr hp
-        //printf("orc_ptr 'move' from %p to %p increment on idx=%d\n", ptr, other.ptr, other.idx);
-        bool reuseIdx = (g_ptp.getUsedHaz(idx, tid) == 1);
-        g_ptp.clear(ptr, idx, tid, lnk, reuseIdx);
-        if (!reuseIdx) idx = g_ptp.getNewIdx(tid);
-        g_ptp.protect_ptr(other.ptr, tid, idx);
-        ptr = other.ptr;
-        lnk = true;
-        return *this;
-    }
-  ]#
+  x.lnk = true 
 
 
 proc incrementOrc(pntr: var ptr OrcHead) {.inline.} =
@@ -372,15 +330,12 @@ proc decrementOrc(pntr: var ptr OrcHead) {.inline.} =
       retire(pntr, tid) # FIXME IMPL
       break
 
-proc initOrcAtomic[T](): OrcAtomic[T] =
-  result.store(nil, moRlx)
-
-proc initOrcAtomic[T](pntr: T): OrcAtomic[T] =
+proc initOrcAtomic(pntr: var ptr OrcHead): OrcAtomic =
   incrementOrc(pntr)
   result.store(pntr, moRlx)
 
-proc destroy[T](x: var OrcAtomic[T]) =
-# proc `=destroy`[T](x: var OrcAtomic[T]) =
+proc destroy(x: var OrcAtomic) =
+# proc `=destroy`(x: var OrcAtomic) =
   block:
     var pntr = x.load(moRlx)
     if pntr.isNil:
@@ -388,16 +343,16 @@ proc destroy[T](x: var OrcAtomic[T]) =
     decrementOrc(pntr)
 
 
-proc `[]`[T](x: var OrcAtomic[T]): var T =
+proc `[]`(x: var OrcAtomic): ptr OrcHead =
   # TODO this is supposed to be the Cpp equivalent overload of `.` field access
   # for objects within the atomic container
   x.load()
 
-proc `[]=`[T](x: var OrcAtomic[T], y: T) =
+proc `[]=`(x: var OrcAtomic, y: ptr OrcHead) =
   x.store(y)
 
-proc `=`[T](x: var OrcAtomic[T]; y: OrcAtomic[T]) =
-  x.store(y.load())
+# proc `=`(x: var OrcAtomic; y: OrcAtomic) =
+#   x.store(y.load())
 
 # REVIEW
 # =======
@@ -408,7 +363,7 @@ proc `=`[T](x: var OrcAtomic[T]; y: OrcAtomic[T]) =
 #   var old = cast[Atomic[T]](oatm).exchange(newval, order)
 #   decrementOrc(old)
 
-# proc exchange[T](oatm: var OrcAtomic[OrcUnsafePtr[T]], newval: T): var OrcUnsafePtr[T] {.inline.} =
+# proc exchange[T](oatm: var OrcAtomic[OrcUnsafePtr], newval: T): var OrcUnsafePtr {.inline.} =
 #   incrementOrc(newval)
 #   var old = cast[Atomic[T]](oatm).exchange(newval)
 #   decrementOrc(old)
@@ -433,7 +388,7 @@ proc `=`[T](x: var OrcAtomic[T]; y: OrcAtomic[T]) =
 #     decrementOrc expected
 #     result = true
 
-# proc load[T](oatm: var OrcAtomic[OrcUnsafePtr[T]]; order: MemoryOrder = moSeqCon): OrcUnsafePtr[T] =
+# proc load[T](oatm: var OrcAtomic[OrcUnsafePtr]; order: MemoryOrder = moSeqCon): OrcUnsafePtr =
 #   let tid = getTid
 #   var pntr = cast[T](getProtected(0, pntr, tid))
 # ====================================================
@@ -535,13 +490,11 @@ proc retireOne(tid: int = getTid()) =
           
 
 proc addRetCnt(tid: int): int {.inline.} =
-  # TODO Optimise by turning into template
   inc gorc.tl[tid].retCnt
   result = gorc.tl[tid].retCnt
 
 
 proc resetRetCnt(tid: int) {.inline.} =
-  # TODO Optimise by turning into template
   gorc.tl[tid].retCnt = 0
 
 # REVIEW
@@ -555,6 +508,12 @@ proc createSharedOrc*[T](tipe: typedesc[T], size: Natural = 1): auto =
   result = initOrcPtr(orcPtr)
   # result = orcPtr.getUserPtr
 
+proc newOrc*[T](tipe: typedesc[T]): auto =
+  var orcp = createSharedOrc(tipe, 1)
+  result = initOrcPtr()
+  result.pntr = orcp
+
+
 # REVIEW
 # this has to return an orc ptr
 proc allocateSharedOrc*(size: Natural): pointer =
@@ -562,11 +521,16 @@ proc allocateSharedOrc*(size: Natural): pointer =
   result = cast[pointer](aptr)
 
 
-template `.`*[T](x: OrcBase[T], field: untyped): untyped =
+template `.`*[T](x: ptr OrcBase[T], field: untyped): untyped =
   ## Allows field access to nuclear pointers of object types. The access of
   ## those fields will also be nuclear in that they enforce atomic operations
   ## of a relaxed order.
   cast[typeof(T().field)](cast[int](x.obj.addr()) + T.offsetOf(field))
+template `.`*[T](x: var OrcPtr[T], field: untyped): untyped =
+  ## Allows field access to nuclear pointers of object types. The access of
+  ## those fields will also be nuclear in that they enforce atomic operations
+  ## of a relaxed order.
+  cast[typeof(T().field)](cast[int](x.pntr.obj.addr()) + T.offsetOf(field))
 
 
 #[

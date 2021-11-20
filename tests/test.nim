@@ -1,3 +1,8 @@
 import lforc {.all.}
 
-var myobj = createSharedOrc(int)
+type
+  MyObj = object
+    field1: int
+    field2: int
+
+var myobj = createSharedOrc(MyObj)

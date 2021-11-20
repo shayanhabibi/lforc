@@ -24,9 +24,9 @@ template getUnmarked*(x: untyped): untyped =
   cast[typeof(x)](cast[uint](x) and unmarkMask)
 
 type
-  HpList*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
+  HpList* = array[maxThreads, array[maxHps, Atomic[ptr OrcHead]]]
   ## Alias for matrix of thread hazard pointers
-  HandOvers*[T] = array[maxThreads, array[maxHps, Atomic[T]]]
+  HandOvers* = array[maxThreads, array[maxHps, Atomic[ptr OrcHead]]]
   ## Alias for matrix of thread handover hazard pointers
 
   OrcHead* = object
@@ -50,10 +50,10 @@ template getUserPtr*[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
   let alignPtr = cast[uint](orcPtr) + 8
   result = cast[ptr T](alignPtr)
 
-converter toOHeadPtr*[T](orcBasePtr: var ptr OrcBase[T]): ptr OrcHead =
+converter toOHeadPtr*[T](orcBasePtr: ptr OrcBase[T]): ptr OrcHead =
   ## OrcHeads are simply an alias for a typeless OrcBase, whereby the embedded
   ## object information are not available.
   cast[ptr OrcHead](orcBasePtr)
 
-# converter toOBasePtr*[T](orcPtr: ptr OrcHead): ptr OrcBase[T] =
-#   cast[ptr OrcBase[T]](orcPtr)
+template getBasePtr*(orcHeadPtr: ptr OrcHead, t: typedesc): untyped =
+  cast[ptr OrcBase[t]](orcHeadPtr)
