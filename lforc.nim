@@ -7,11 +7,11 @@
 
 import lforc/threadreg
 import lforc/spec
-import lforc/ptp
+
 import wtbanland/atomics
 
-## Contains the PTPOrcGC Object and procedures
-
+export spec
+export threadreg
 
 type
   TLInfo = object
@@ -56,7 +56,6 @@ proc tryHandover(pntr: var ptr OrcHead): bool {.inline.}
 proc retireOne(tid: int = getTid())
 proc addRetCnt(tid: int): int {.inline.}
 proc resetRetCnt(tid: int) {.inline.}
-
 # =====================================================
 # End    | Forward decls
 
@@ -86,23 +85,10 @@ proc initPTPOrcGc =
 proc tearDownOrcGc =
   destroy(gorc)
 
-# REVIEW
-proc createSharedOrc*[T](tipe: typedesc[T], size: Natural): ptr T =
-  ## Principal: Allocate shared block with 8 byte header for metadata
-  # Issue with this is that sizeof will not correctly indicate the size of the object
-  # this also plays issues if the object the person has created is supposed to be
-  # cache lined since they will be unaware that the object is not ipsilateral
-  let orcPtr = createShared(OrcBase[T])
-  result = orcPtr.getUserPtr
-  
-  # REVIEW
-proc allocateSharedOrc*(size: Natural): pointer =
-  let aptr = cast[uint](allocShared(sizeof(size + 8))) + 8'u
-  result = cast[pointer](aptr)
 
 # In terms of optimisation, objects will contain the thread ids themselves
 # and may use that instead of fetching the value. Benchmark?
-# REVIEW
+
 proc getNewIdx(tid: int; start: int = 1): int =
   var idx = start
   block loop:
@@ -156,8 +142,10 @@ proc clear(pntr: var ptr OrcHead, idx: int, tid: int, linked: bool, reuse: bool)
       if pntr.orc.compareExchange(lorc, lorc + bretired):
         retire(pntr, tid)
 
+proc clear[T](pntr: var ptr OrcBase[T], idx: int, tid: int, linked: bool, reuse: bool) {.inline.} =
+  pntr.toOHeadPtr.clear(idx, tid, linked, reuse)
+
 proc getUsedHaz(idx: int; tid: int = getTid): int {.inline.} =
-  # NOTE is this optimised if its a template instead?
   result = gorc.tl[tid].usedHaz[idx]
 
 proc getProtected[T](index: int; adr: ptr Atomic[T]; tid: int = getTid): T {.inline.} =
@@ -170,14 +158,27 @@ proc getProtected[T](index: int; adr: ptr Atomic[T]; tid: int = getTid): T {.inl
 proc protectPtr(pntr: ptr OrcHead; tid: int; idx: int) {.inline.} =
   gorc.hp[tid][idx].store(getUnmarked(pntr), moRel)
 
-proc initOrcPtr[T](pntr: T, tid: int16, idx: int8, linked: bool): OrcPtr[T] =
-  OrcPtr[T](pntr, tid, idx, linked)
+proc protectPtr[T](pntr: ptr OrcBase[T]; tid: int; idx: int) {.inline.} =
+  pntr.toOHeadPtr.protectPtr(tid, idx)
+
+# proc initOrcPtr(pntr: ptr OrcHead, tid: int16, idx: int8, linked: bool): OrcPtr[ptr OrcHead] =
+  # OrcPtr[ptr OrcHead](pntr, tid, idx, linked)
+# proc initOrcPtr[T](pntr: ptr OrcBase[T], tid: int16, idx: int8, linked: bool): OrcPtr[ptr OrcBase[T]] =
+  # OrcPtr[ptr OrcBase[T]](pntr, tid, idx, linked)
 
 proc initOrcPtr(): OrcPtr[ptr OrcHead] =
   result = OrcPtr[ptr OrcHead](tid: cast[int16](getTid))
   result.idx = cast[int8](getNewIdx result.tid)
 
+proc initOrcPtr[T](pntr: ptr OrcBase[T]): OrcPtr[ptr OrcBase[T]] =
+  result = OrcPtr[ptr OrcBase[T]](tid: cast[int16](getTid))
+  result.idx = cast[int8](getNewIdx result.tid)
+
 proc destroy[T](x: var OrcPtr[T]) =
+  clear(x.pntr, x.idx, x.tid, x.lnk, false)
+proc destroy(x: var OrcPtr[ptr OrcHead]) =
+  clear(x.pntr, x.idx, x.tid, x.lnk, false)
+proc destroy[T](x: var OrcPtr[ptr OrcBase[T]]) =
   clear(x.pntr, x.idx, x.tid, x.lnk, false)
 
 proc `==`[T](x, y: OrcPtr[T] | OrcUnsafePtr[T]): bool {.inline.} =
@@ -191,7 +192,7 @@ proc `!=`[T](x: OrcUnsafePtr[T] | OrcPtr[T], y: T): bool {.inline.} =
 proc `[]`[T](x: OrcUnsafePtr[T] | OrcPtr[T]): T {.inline.} =
   x.pntr
 
-proc copy[T](x: OrcPtr[T]): var OrcPtr[T] =
+proc copy[T](x: OrcPtr[T]): var OrcPtr[T] {.inline.} =
   result.tid = x.tid
   result.idx = x.idx
   result.pntr = x.pntr
@@ -201,6 +202,11 @@ proc copy[T](x: OrcPtr[T]): var OrcPtr[T] =
     protectPtr(result.pntr, result.tid.int, result.idx.int)
   else:
     usingIdx(x.idx, x.tid)
+proc copy[T](x: OrcPtr[ptr OrcBase[T]]): var OrcPtr[ptr OrcBase[T]] {.inline.} =
+  result = copy(x)
+
+proc copy(x: OrcPtr[ptr OrcHead]): var OrcPtr[ptr OrcHead] {.inline.} =
+  result = copy(x)
 
 proc copyMove[T](x: OrcPtr[T]): var OrcPtr[T] =
   result.tid = x.tid
@@ -537,6 +543,31 @@ proc addRetCnt(tid: int): int {.inline.} =
 proc resetRetCnt(tid: int) {.inline.} =
   # TODO Optimise by turning into template
   gorc.tl[tid].retCnt = 0
+
+# REVIEW
+# This has to return an orcPtr
+proc createSharedOrc*[T](tipe: typedesc[T], size: Natural = 1): auto =
+  ## Principal: Allocate shared block with 8 byte header for metadata
+  # Issue with this is that sizeof will not correctly indicate the size of the object
+  # this also plays issues if the object the person has created is supposed to be
+  # cache lined since they will be unaware that the object is not ipsilateral
+  let orcPtr = createShared(OrcBase[T], size)
+  result = initOrcPtr(orcPtr)
+  # result = orcPtr.getUserPtr
+
+# REVIEW
+# this has to return an orc ptr
+proc allocateSharedOrc*(size: Natural): pointer =
+  let aptr = cast[uint](allocShared(sizeof(size + 8))) + 8'u
+  result = cast[pointer](aptr)
+
+
+template `.`*[T](x: OrcBase[T], field: untyped): untyped =
+  ## Allows field access to nuclear pointers of object types. The access of
+  ## those fields will also be nuclear in that they enforce atomic operations
+  ## of a relaxed order.
+  cast[typeof(T().field)](cast[int](x.obj.addr()) + T.offsetOf(field))
+
 
 #[
 public:

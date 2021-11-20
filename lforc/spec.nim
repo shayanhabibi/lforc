@@ -50,9 +50,10 @@ template getUserPtr*[T](orcPtr: ptr OrcHead | ptr OrcBase[T]): ptr T =
   let alignPtr = cast[uint](orcPtr) + 8
   result = cast[ptr T](alignPtr)
 
-converter toOPtr*[T](orcBasePtr: ptr OrcBase[T]): ptr OrcHead =
+converter toOHeadPtr*[T](orcBasePtr: var ptr OrcBase[T]): ptr OrcHead =
   ## OrcHeads are simply an alias for a typeless OrcBase, whereby the embedded
   ## object information are not available.
   cast[ptr OrcHead](orcBasePtr)
 
-converter toOBasePtr*[T](orcPtr: ptr OrcBase): ptr OrcBase[T] = cast[ptr OrcBase[T]](orcPtr)
+# converter toOBasePtr*[T](orcPtr: ptr OrcHead): ptr OrcBase[T] =
+#   cast[ptr OrcBase[T]](orcPtr)
