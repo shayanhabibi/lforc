@@ -6,3 +6,4 @@ type
     field2: int
 
 var myobj = createSharedOrc(MyObj)
+echo typeof myobj

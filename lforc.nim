@@ -124,7 +124,6 @@ proc clear(pntr: sink ptr OrcHead, idx: int, tid: int, linked: bool, reuse: bool
   elif not pntr.isNil:
     pntr = getUnmarked(pntr) # LINK
     var lorc: uint = pntr.orc.load(moAcq)
-    echo "this"
     if ocnt(lorc) == orcZero:
       if pntr.orc.compareExchange(lorc, lorc + bretired):
         retire(pntr, tid)
