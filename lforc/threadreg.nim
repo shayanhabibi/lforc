@@ -97,3 +97,5 @@ proc initThreadRegistry* =
   for r in thrReg():
     r.unsafeaddr[].store(highnum)
   assert getTid() == 0,  "Thread Registry has already been initiatialised"
+
+initThreadRegistry()

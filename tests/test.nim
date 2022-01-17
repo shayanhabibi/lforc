@@ -5,5 +5,5 @@ type
     field1: int
     field2: int
 
-var myobj = createSharedOrc(MyObj)
+var myobj = newOrc MyObj
 echo typeof myobj
