@@ -5,17 +5,18 @@ import lforc/threadreg
 # Define types
 type
   OrcPointer {.borrow.} = distinct pointer
-  OrcPtr[T] {.borrow.} = distinct ptr T
+  OrcPtr[T] {.borrow.} = distinct ptr[T]
 
   SomeOrcPointer[T] = OrcPointer | OrcPtr[T]
 
-converter toPointer(x: OrcPointer): pointer = cast[pointer](x)
-converter toOrcPointer(x: OrcPtr): OrcPointer = cast[OrcPointer](x)
-# converter toOrcPtr[T](x: OrcPointer): OrcPtr[T] = cast[OrcPtr[T]](x)
+converter toPointer*(x: OrcPointer): pointer = cast[pointer](x)
+converter toPointer*[T](x: OrcPtr[T]): pointer = cast[pointer](x)
+converter toOrcPointer*[T](x: OrcPtr[T]): OrcPointer = cast[OrcPointer](x)
+converter toOrcPtr[T: typedesc](x: OrcPointer): OrcPtr[T] = cast[OrcPtr[T]](x)
 
 template orc(x: SomeOrcPointer): ptr int =
   ## Access the orc counter of a OrcPointer
-  cast[ptr int](x -% 8)
+  cast[ptr int](cast[pointer](x) -% 8)
 
 type
   TLInfo = object
@@ -95,7 +96,7 @@ template clear(pntr: SomeOrcPointer; idx: int; tid: int; linked, reuse: bool) =
 proc getUsedHaz(idx, tid: int): int {.inline.} =
   ogc.tl[tid].usedHaz[idx]
 
-template getProtected(idx: int, addy: typed, tid: int): typed =
+template getProtected(idx: int, addy: typed, tid: int): typed = # REVIEW used in atomic_orc
   var pub, pntr: typeof(addy)
   while (pub = addy.load(SeqCst); pub != pntr):
     ogc.hp[tid][idx].store(getUnmarked(pub))
@@ -135,7 +136,7 @@ proc retire(pntr: var SomeOrcPointer; tid: int) =
     let lmaxHps = ogc.maxHps.load(Acq)
     for i in 0..<lmaxHps:
       if ogc.hp[tid][i].load(Rlx) == pntr:
-        pntr = ogc.handovers[tid][i].exchange(pntr, SeqCst) # TODO is atomic exchange
+        pntr = ogc.handovers[tid][i].exchange(pntr, SeqCst)
         break
   ogc.tl[tid].retireStarted = true
   var i: int
@@ -168,7 +169,7 @@ proc retire(pntr: SomeOrcPointer) =
   let tid = getTid
   retire(pntr, tid)
 
-proc retireOne(tid: int) =
+proc retireOne(tid: int) = # REVIEW used in orc_atomic only
   let lmaxHps = ogc.maxHps.load(Acq)
   for idx in 0..<lmaxHps:
     var obj = ogc.handovers[tid][idx].load(Rlx)
@@ -186,19 +187,18 @@ proc retireOne(tid: int) =
         return
 
 type
-  LFOrcPtr[T: SomeOrcPointer] = object
-    pntr: T
+  LFPointer = object
+    pntr: OrcPointer
+    tid: int16
+    idx: int8
+    lnk: bool
+  LFPtr[T] = object
+    pntr: OrcPointer
     tid: int16
     idx: int8
     lnk: bool
 
-proc initLFOrcPtr[T: SomeOrcPointer](pntr: T; tid: int16; idx: int8; linked: bool): LFOrcPtr[T] =
-  LFOrcPtr[T](pntr: pntr, tid: tid, idx: idx, lnk: linked)
-proc initLFOrcPtr[T: SomeOrcPointer]() =
-  LFOrcPtr[T](lnk: true, tid: getTid, getNewIdx(getTid))
-proc `=destroy`*[T](lfp: var LFOrcPtr[T]) =
-  clear(lfp.pntr, lfp.idx, lfp.tid, lfp.lnk, false)
-proc `=copy`*[T](dest: var LFOrcPtr[T]; other: LFOrcPtr[T]) =
+template copyImpl: untyped {.dirty.} =
   dest.tid = other.tid
   dest.idx = other.idx
   dest.pntr = other.pntr
@@ -208,7 +208,8 @@ proc `=copy`*[T](dest: var LFOrcPtr[T]; other: LFOrcPtr[T]) =
     protectPtr(dest.pntr, dest.tid, dest.idx)
   else:
     usingIdx(dest.idx, dest.tid)
-proc `=sink`*[T](dest: var LFOrcPtr[T]; other: LFOrcPtr[T]) =
+  echo "copied"
+template sinkImpl: untyped {.dirty.} =
   dest.tid = other.tid
   dest.idx = other.idx
   dest.pntr = other.pntr
@@ -218,9 +219,46 @@ proc `=sink`*[T](dest: var LFOrcPtr[T]; other: LFOrcPtr[T]) =
     protectPtr(dest.pntr, dest.tid, dest.idx)
   else:
     other.idx.unsafeAddr()[] = 0
+  echo "sunk"
+proc `=copy`*[T](dest: var LFPtr[T]; other: LFPtr[T]) =
+  copyImpl()
+proc `=sink`*[T](dest: var LFPtr[T]; other: LFPtr[T]) =
+  sinkImpl()
+proc `=copy`*(dest: var LFPointer; other: LFPointer) =
+  copyImpl()
+proc `=sink`*(dest: var LFPointer; other: LFPointer) =
+  sinkImpl()
 
-proc newOrc*(tipe: typedesc): LFOrcPtr[OrcPointer] =
+proc `=destroy`(lfp: var LFPointer) =
+  clear(lfp.pntr, lfp.idx, lfp.tid, lfp.lnk, false)
+proc `=destroy`*[T](lfp: var LFPtr[T]) =
+  clear(lfp.pntr, lfp.idx, lfp.tid, lfp.lnk, false)
+  echo "destroy called"
+
+template initLFImplWArgs(): untyped {.dirty.} =
+  typeof(result)(pntr: pntr, tid: tid, idx: idx, lnk: linked)
+template initLFImpl(): untyped {.dirty.} =
+  let tid = getTid
+  let newidx = getNewIdx tid
+  typeof(result)(lnk: true, tid: tid.int16, idx: newidx.int8)
+
+
+proc initLFPointer(pntr: OrcPointer; tid: int16; idx: int8; linked: bool): LFPointer =
+  initLFImplWArgs()
+proc initLFPointer(): LFPointer =
+  initLFImpl()
+proc initLFPtr[T](pntr: OrcPointer; tid: int16; idx: int8; linked: bool): LFPtr[T] =
+  initLFImplWArgs()
+proc initLFPtr[T](): LFPtr[T] =
+  initLFImpl()
+
+
+
+proc newOrc*(tipe: typedesc): LFPtr[tipe] =
   let pntr = cast[OrcPointer](allocShared(sizeof(tipe) + 8) +% 8)
   let tid = getTid()
-  result = initLFOrcPtr(pntr, tid.int16, tid.getNewIdx.int8, false)
+  result = initLFPtr[tipe](pntr, tid.int16, (getNewIdx tid).int8, false)
   result.pntr.orc[] = orcZero
+
+proc `[]`*[T](lfp: LFPtr[T]): var T =
+  cast[ptr T](lfp.pntr)[]
